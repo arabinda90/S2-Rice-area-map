@@ -1,0 +1,620 @@
+//-----Cropland layer from 10m global LUCL clification---------
+
+//Gong P, Liu H, Zhang M, Li C, Wang J, Huang H, Clinton N, Ji L, Li Wenyu, Bai Y, et al. 2019. Stable classification with limited sample: transferring a 30-m resolution sample set collected in 2015 to mapping 10-m resolution global land cover in 2017. Sci Bull. 64(6):370–373
+var WB_without_Mangrove = ee.FeatureCollection("users/maitiarabindageo454/wb_without_mangrove");
+var Cropland = ee.Image("users/maitiarabindageo454/WB_CL_GLC_2017n")
+
+//------For trial area----------------------------
+
+// var region = 
+//     ee.Geometry.Polygon(
+//         [[[87.49024978184319, 22.85708119922871],
+//           [87.49024978184319, 22.74725865168575],
+//           [87.61075606846428, 22.74725865168575],
+//           [87.61075606846428, 22.85708119922871]]])
+
+//----------For West Bengal--------------------------
+var  region1 = 
+    ee.Geometry.Polygon(
+        [[[85.7611585481274, 27.324639145340612],
+          [85.7611585481274, 21.413906125246918],
+          [89.9579358918774, 21.413906125246918],
+          [89.9579358918774, 27.324639145340612]]])
+          
+          
+var WB = ee.FeatureCollection("users/maitiarabindageo454/Wb_District_new")
+
+
+//#-------Import global surface water layer from Landsat--------------
+//Pekel JF, Cottam A, Gorelick N, Belward AS. 2016. High-resolution mapping of global surface water and its long-term changes. Nature. 540(7633):418–422. http://dx.doi.org/10.1038/nature20584
+var YearlyHistory = ee.ImageCollection("JRC/GSW1_1/YearlyHistory")
+    .filterDate('2018-01-01', '2018-12-31')
+    //.select('waterClass')
+//print(YearlyHistory, 'YearlyHistory')
+var stack_water = function(YearlyHistory) {
+  // Create an initial image.
+  var first = ee.Image(YearlyHistory.first()).select([]);
+
+  // Write a function that appends a band to an image.
+  var appendBands = function(image, previous) {
+    return ee.Image(previous).addBands(image);
+  };
+  return ee.Image(YearlyHistory.iterate(appendBands, first));
+};
+var stacked = stack_water(YearlyHistory.select(['waterClass']))     
+
+var JRCwater_class = ee.Image(1)
+          .where(stacked.gt(0).and(stacked.lte(1)), 1) //-83 to 100 m
+          .where(stacked.gt(1).and(stacked.lte(4)), 2)
+          
+var JRCwater = JRCwater_class.eq(1); // create a mask for crops
+var JRCwater_layer = JRCwater_class.mask(JRCwater)
+
+//------ Use this function to add several indices to Sentinel-2 imagery.--------
+var addVariables = function(image) {
+ // var DOY = image.date().getRelative('day', 'year')
+  //var year = image.date().get('year')
+  
+  return image
+    // Add a NDVI band.
+    //.addBands(image.normalizedDifference(['nir', 'red']).toDouble().rename('NDVI'))
+    // Add a EVI band.
+    .addBands(image.expression('2.5*((nir-red)/(nir+6*red-7.5*blue+1))', {
+      'nir':image.select('B8'),
+      'red':image.select('B4'),
+      'blue':image.select('B2')
+    }).toDouble().rename('EVI'))
+    // Add a LSWI band.
+      .addBands(image.expression('((nir - swir1)/(nir + swir1))+0.05',{
+      'nir': image.select('B8'),
+      'swir1': image.select('B11'),
+    }).toDouble().rename('LSWI')) 
+    // add a doy band.
+    //.addBands(ee.Image(DOY).rename('DOY').toDouble())
+    // add a year band.
+    //.addBands(ee.Image(year).rename('Year').toDouble())
+   // .addBands(image.metadata('system:time_start').divide(1e18).rename('time'))
+   //.addBands(image.metadata('system:time_start','Date'))
+    //.set('DOY',DOY)
+};
+
+//-------------------S2 Data precess-------------------------------
+
+var start = ee.Date('2018-01-01');
+var finish = ee.Date('2018-12-31');
+
+var criteria = ee.Filter.and(
+    ee.Filter.bounds(region1), ee.Filter.date(start, finish));
+var cloud_perc = 100;//Max cloud percentile per scene.    
+
+
+//--------Resample of SWIR band (20m) to 10 m resolution---------------------
+function resample(image) { 
+   var b4 =  image.select('B11').projection()
+    var b11 = image.select('B11');
+    var b11_res = b11.resample('bilinear').reproject(b4);
+    return image;
+}
+
+
+// -- Collections of Sentinel 2 TOA data
+var S2_col = ee.ImageCollection("COPERNICUS/S2")
+                .filter(criteria)
+                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', cloud_perc))
+                .map(function(img) { return img.updateMask(JRCwater_layer)})
+                .map(function(image){return image.clip(region1)})
+                .map(resample);
+                
+print(S2_col, 's2');     
+
+
+                
+//----- Import the SIAC atmospheric correction module----------
+var siac = require('users/marcyinfeng/utils:SIAC');
+
+//var S2_boa = siac.get_sur(S2_col.first()); 
+
+//---------Add time as a band to S2 images---------------------------
+var createTimeBand = function(image) {
+  // Scale milliseconds by a large constant to avoid very small slopes
+  // in the linear regression output.
+  return image.addBands(image.metadata('system:time_start').divide(1e18));
+};
+
+/// Difference in days between start and finish----------
+var diff = finish.difference(start, 'day')
+//print(diff, 'diff')
+// Make a list of all dates
+var range = ee.List.sequence(0, diff,5)
+          .map(function(day){
+            return start.advance(day,'day')
+          })
+//print(range, 'range')
+//----------function to get cloud score----------------------
+// simply the cloud_and_shadow_mask
+function cloudMask(toa) {
+  // authors: Matt Hancher, Chris Hewig and Ian Housman
+  
+  function rescale(img, thresholds) {
+    return img.subtract(thresholds[0]).divide(thresholds[1] - thresholds[0]);
+  }
+  
+  // Compute several indicators of cloudyness and take the minimum of them.
+  var score = ee.Image(1);
+  
+  //Clouds are reasonably bright
+  score = score.min(rescale(toa.select(['B2']), [0.1, 0.5]));
+  score = score.min(rescale(toa.select(['B1']), [0.1, 0.3]));
+  score = score.min(rescale(toa.select(['B1']).add(toa.select(['B10'])), [0.15, 0.2]));
+  score = score.min(rescale(toa.select(['B4']).add(toa.select(['B3'])).add(toa.select('B2')), [0.2, 0.8]));
+
+  //Clouds are moist
+  var ndmi = toa.normalizedDifference(['B8A','B11']);
+  score=score.min(rescale(ndmi, [-0.1, 0.1]));
+  
+  // However, clouds are not snow.
+  var ndsi = toa.normalizedDifference(['B3', 'B11']);
+  score=score.min(rescale(ndsi, [0.8, 0.6]));
+  
+  // a (somewhat arbitrary) threshold 
+  var cloudScoreThreshold = 0.2;
+  var cloud = score.gt(cloudScoreThreshold);
+  
+  var mask = cloud.eq(0);
+  return toa.updateMask(mask);
+} 
+
+//--------SIAC atmospheric correction-------------------------
+/* 
+For a description of the SIAC method, please see <https://github.com/MarcYin/SIAC_GEE>, and 
+Yin, F., Lewis, P. E., Gomez-Dans, J., & Wu, Q. (2019, February 21). 
+A sensor-invariant atmospheric correction method: application to Sentinel-2/MSI and Landsat 8/OLI. 
+https://doi.org/10.31223/osf.io/ps957
+*/
+
+var atcor = function(im){
+  var B10 = im.select(['B10']).divide(10000).toDouble()
+  var sic_out = siac.get_sur(im)
+  return sic_out.addBands(B10)
+   //.addBands(im.metadata('system:time_start'))
+   .addBands(im.metadata('system:time_start').divide(1e18).rename('time'))
+}
+
+//--------Mosaic S2 tiles for the study area------------------
+var day_mosaics = function(date, newlist) {
+  // Cast
+  date = ee.Date(date)
+  newlist = ee.List(newlist)
+  
+  // Filter collection between date and the next day
+  var filtered = S2_col.filterDate(date, date.advance(5,'day')) //5 day interval
+                         .map(atcor)
+                         .map(cloudMask)
+                         .map(createTimeBand)
+                          //.map(function(image){return image.clip(table);});
+  // advance just one month
+  var end = date;
+  // Make the mosaic
+  var image = ee.Image(filtered.mosaic())
+  
+  // Add the mosaic to a list only if the collection has images
+  return ee.List(ee.Algorithms.If(filtered.size(), newlist.add(image.set('system:time_start', end)), newlist))
+}
+
+// Iterate over the range to make a new list, and then cast the list to an imagecollection
+var newcol1 = ee.ImageCollection(ee.List(range.iterate(day_mosaics, ee.List([]))))
+
+//print(time,'newcol1');
+
+// var listOfImages =newcol1.toList(newcol1.size())
+// var firstImage = ee.Image(listOfImages.get(0))
+// var secondImage = ee.Image(listOfImages.get(12))
+
+
+// var Color_comp_01 = {bands:"B4,B3,B2", min: 0.0, max: 0.2, gamma: 1};
+// var Color_comp =    {bands:"B4,B3,B2", min:200, max:2000, gamma: 1};
+
+//Map.addLayer(secondImage, Color_comp_01, 'BOA');
+//Map.addLayer(S2_boa, Color_comp_01, 'BOA');
+
+
+var add_vi = newcol1.map(addVariables)
+
+print(add_vi,'add_vi');
+
+
+// var listOfImages =add_vi.toList(newcol1.size())
+// var firstImage = ee.Image(listOfImages.get(0))
+// var secondImage = ee.Image(listOfImages.get(12))
+
+// Map.addLayer(add_vi.select('EVI'))
+
+
+// Replace masked pixels by the mean of the previous and next months 
+// (otherwise, how to deal with the first images??)
+var gapfill = add_vi.map(function(image){
+  var currentDate = ee.Date(image.get('system:time_start'));
+  var meanImage = add_vi.filterDate(
+                currentDate.advance(-15, 'day'), currentDate.advance(15, 'day')).mean(); 
+  // replace all masked values:
+  return meanImage.where(image, image)
+  .set('system:time_start', image.get('system:time_start'))
+});
+
+
+// //---------------Function to Linear smooth time series---------------------------
+// stacks windows of linear regression results
+// requires that a variable 'data' exists with EVI and time bands
+
+//-----------------For LSWI---------------------------------
+var lm_lswi = function smoother(t){
+  // helper function to apply linear regression equation
+  function applyFit(img){
+      return img.select('time').multiply(fit.select('scale')).add(fit.select('offset'))
+              .set('system:time_start',img.get('system:time_start')).rename('LSWI_lm');
+  }
+  t = ee.Date(t);
+  
+  var window = gapfill.filterDate(t.advance(-windowSize,'day'),t.advance(windowSize,'day'));
+    
+  var fit = window.select(['time','LSWI'])
+    .reduce(ee.Reducer.linearFit());
+    
+  return window.map(applyFit).toList(5);
+}
+//-----------------For EVI---------------------------------
+var lm_evi = function smoother(t){
+  // helper function to apply linear regression equation
+  function applyFit(img){
+      return img.select('time').multiply(fit.select('scale')).add(fit.select('offset'))
+              .set('system:time_start',img.get('system:time_start')).rename('EVI_lm');
+  }
+  t = ee.Date(t);
+  
+  var window = gapfill.filterDate(t.advance(-windowSize,'day'),t.advance(windowSize,'day'));
+    
+  var fit = window.select(['time','EVI'])
+    .reduce(ee.Reducer.linearFit());
+    
+  return window.map(applyFit).toList(5);
+}
+// function to reduce time stacked linear regression results
+// requires that a variable 'fitIC' exists from the smooter function
+var lswi_fu = function reduceFits(t){
+  t = ee.Date(t);
+  return fitIC.filterDate(t.advance(-windowSize,'day'),t.advance(windowSize,'day'))
+              .mean().set('system:time_start',t.millis()).rename('LSWI_lm');
+}
+
+var evi_fu = function reduceFits(t){
+  t = ee.Date(t);
+  return fitIC_evi.filterDate(t.advance(-windowSize,'day'),t.advance(windowSize,'day'))
+              .mean().set('system:time_start',t.millis()).rename('EVI_lm');
+}
+
+
+var dates = ee.List(gapfill.aggregate_array('system:time_start'));
+//print(dates, 'dates')
+var windowSize = 15; //days on either side
+
+var fitIC = ee.ImageCollection(dates.map(lm_lswi).flatten());
+var fitIC_evi = ee.ImageCollection(dates.map(lm_evi).flatten());
+
+var smoothed_lswi = ee.ImageCollection(dates.map(lswi_fu));
+var smoothed_evi = ee.ImageCollection(dates.map(evi_fu));
+print(smoothed_evi)
+
+// var smoothed_evi =newcol1.toList(smoothed_evi.size())
+// var firstImage = ee.Image(listOfImages.get(0))
+// var secondImage = ee.Image(smoothed_evi.get(3))
+
+//----------------stack layers of EVI------------------------
+var stack_lswi = function(smoothed_lswi) {
+  // Create an initial image.
+  var first = ee.Image(smoothed_lswi.first()).select([]);
+
+  // Write a function that appends a band to an image.
+  var appendBands = function(image, previous) {
+    return ee.Image(previous).addBands(image);
+  };
+  return ee.Image(smoothed_lswi.iterate(appendBands, first));
+};
+var stacked_lswi = stack_lswi(smoothed_lswi.select(['LSWI_lm']))
+
+//----------------stack layers of EVI------------------------
+var stack_evi = function(smoothed_evi) {
+  // Create an initial image.
+  var first = ee.Image(smoothed_evi.first()).select([]);
+
+  // Write a function that appends a band to an image.
+  var appendBands = function(image, previous) {
+    return ee.Image(previous).addBands(image);
+  };
+  return ee.Image(smoothed_evi.iterate(appendBands, first));
+};
+var stacked_evi = stack_evi(smoothed_evi.select(['EVI_lm']))
+
+
+//--------------------Difference between LSWI and EVI-------------------------
+
+var LSWI_EVI = stacked_lswi.subtract(stacked_evi).clip(WB).clip(WB_without_Mangrove).updateMask(Cropland)
+print(LSWI_EVI)
+
+//Map.addLayer(LSWI_EVI)
+
+//----------------------------1st part (Rice pixels at transplanting time) (PPPM)-----------------------------------------
+
+var greter_0_mask_GPP = LSWI_EVI.gt(0)
+var greter_0_mask_pix_GPP = LSWI_EVI.updateMask(greter_0_mask_GPP)
+
+//print(greter_0_mask_pix_GPP, 'greter_0_mask_pix_GPP')
+var select_bands_SoS = greter_0_mask_pix_GPP.select(ee.List.sequence(36,51))//Jul to  15 sep, 2018is transplanting time
+//print(select_bands_SoS, 'select_bands_SoS')
+var mean_rice_SOS = select_bands_SoS.reduce(ee.Reducer.mean())
+
+var reclass = mean_rice_SOS.divide(2).ceil(); // reclass 
+//print(reclass, 'reclass')
+
+// //-------(IPPPM)-----2nd (Exclude those rice pixels in transplanting time whose LSWI- EVI > 0 at Maturity time) Layer 52 to 56 ----------------
+var LSWI_EVI = LSWI_EVI.updateMask(mean_rice_SOS)
+
+//var LSWI_EVI = stacked_lswievi.updateMask(mean_rice_SOS)
+var lessthan_0_mask_of_LSWIEVI = LSWI_EVI.lt(0)
+var greaterthan_0_mask_of_LSWIEVI = LSWI_EVI.gt(0)
+var mask_of_LSWIEVI_lt0 = LSWI_EVI.updateMask(lessthan_0_mask_of_LSWIEVI)
+var mask_of_LSWIEVI_gt0 = LSWI_EVI.updateMask(greaterthan_0_mask_of_LSWIEVI)
+var select_during_MGT_lt0 = mask_of_LSWIEVI_lt0.select(ee.List.sequence(52,56))
+var select_during_MGT_gt0 = mask_of_LSWIEVI_gt0.select(ee.List.sequence(52,56))
+var mean_MGT2_lt0 = select_during_MGT_lt0.reduce(ee.Reducer.sum()).rename('MGT_LSWI_EVI_lt0')// rice
+//var mean_MGT2_gt0 = select_during_MGT_gt0.reduce(ee.Reducer.sum()).rename('MGT_LSWI_EVI_gt0')// non-rice
+var rice_reclass = mean_MGT2_lt0.divide(2).ceil();
+print(rice_reclass, 'rice_reclass')
+
+//------You can not plot a spatial map in the GEE platform but you will export it in GEE assets then you can plot it. 
+//Map.addLayer(sinImage, {min: -1, max: 1}, 'sin');
+//Map.addLayer(mean_MGT2_lt0, {palette:'#6eff00'}, 'mean_MGT2_lt0', false)
+//Map.addLayer(mean_MGT2_gt0, {palette:'blue'}, 'mean_MGT2_gt0', false)
+
+
+//------Eport to assets LSWI-EVI ---------------------------
+Export.image.toAsset({
+  image: rice_reclass,
+  description: 'S2_SIAC_MGT_Rice',
+  assetId: 'S2_SIAC_MGT_Rice',
+  scale: 10,
+  region: region1,
+  maxPixels: 1e13 
+});
+
+// //-----------Area Calculation---------------------------------------------
+// //After exporting the final layer of Rice to the assets you call this layer and calculate area 
+// var WB = ee.FeatureCollection("users/maitiarabindageo454/Wb_District_new")
+// //Map.addLayer(Wb_dist)
+// // //---------------area calculation---------------------------------------------------
+// //var image_class = image_class.updateMask(image_class.mask().eq(1))
+// //print(Wb_dist, 'Wb_dist')
+// var Bankura =  ee.Feature(WB.filterMetadata('DISTRICT', 'equals','Bankura').first()).geometry()
+// var North_pargana =  ee.Feature(WB.filterMetadata('DISTRICT', 'equals','North 24-pargana').first()).geometry()
+// var Paschim_Barddhaman =  ee.Feature(WB.filterMetadata('DISTRICT', 'equals','Paschim Barddhaman').first()).geometry()
+// var Purba_Barddhaman =  ee.Feature(WB.filterMetadata('DISTRICT', 'equals','Purba Barddhaman').first()).geometry()
+// var Birbhum =  ee.Feature(WB.filterMetadata('DISTRICT', 'equals','Birbhum').first()).geometry()
+// var Dakshin_Dinajpur =  ee.Feature(WB.filterMetadata('DISTRICT', 'equals','Dakshin Dinajpur').first()).geometry()
+// var Darjeeling =  ee.Feature(WB.filterMetadata('DISTRICT', 'equals','Darjeeling').first()).geometry()
+// var Kalimpong =  ee.Feature(WB.filterMetadata('DISTRICT', 'equals','Kalimpong').first()).geometry()
+// var Purba_Medinipur =  ee.Feature(WB.filterMetadata('DISTRICT', 'equals','Purba Medinipur').first()).geometry()
+// var Howrah =  ee.Feature(WB.filterMetadata('DISTRICT', 'equals','Howrah').first()).geometry()
+// var Hooghli =  ee.Feature(WB.filterMetadata('DISTRICT', 'equals','Hooghli').first()).geometry()
+// var Alipurduar =  ee.Feature(WB.filterMetadata('DISTRICT', 'equals','Alipurduar').first()).geometry()
+// var Jalpaiguri =  ee.Feature(WB.filterMetadata('DISTRICT', 'equals','Jalpaiguri').first()).geometry()
+// var Cooch_Behar =  ee.Feature(WB.filterMetadata('DISTRICT', 'equals','Cooch Behar').first()).geometry()
+// var Malda =  ee.Feature(WB.filterMetadata('DISTRICT', 'equals','Malda').first()).geometry()
+// var Murshidabad =  ee.Feature(WB.filterMetadata('DISTRICT', 'equals','Murshidabad').first()).geometry()
+// var Nadia =  ee.Feature(WB.filterMetadata('DISTRICT', 'equals','Nadia').first()).geometry()
+// var Puruliya =  ee.Feature(WB.filterMetadata('DISTRICT', 'equals','Puruliya').first()).geometry()
+// var Uttar_Dinajpur =  ee.Feature(WB.filterMetadata('DISTRICT', 'equals','Uttar Dinajpur').first()).geometry()
+// var Paschim_Medinipur =  ee.Feature(WB.filterMetadata('DISTRICT', 'equals','Paschim Medinipur').first()).geometry()
+// var Jhargram =  ee.Feature(WB.filterMetadata('DISTRICT', 'equals','Jhargram').first()).geometry()
+// var South_pargana =  ee.Feature(WB.filterMetadata('DISTRICT', 'equals','South 24-pargana').first()).geometry()
+
+// var pixelscount = mean_rice_MGT.reduceRegion({
+//   reducer: ee.Reducer.count(),
+//   geometry: Purba_Barddhaman,
+//   scale: 30,
+//   maxPixels: 10e9,
+//   bestEffort: true,
+// });
+// print('xxxxx', pixelscount);
+
+// //--------Meter to hectare convert----------------------------
+// var meter_ha = ee.Number(900).multiply(ee.Number(0.0001))
+
+// //-------Area in Hectare----------------------------------------
+// var area = ee.Number(pixelscount.get('max')).multiply(meter_ha)
+
+// print(area)
+//---------------------End of this process--------------------------------------------------------------------------------
+
+
+
+
+
+
+
+//------------------------Alternative way of identification--------------------------------------------------------------
+// //--------merege evi and lswi---------------------------------
+// // Use an equals filter to define how the collections match.
+// var filter = ee.Filter.equals({
+//   leftField: 'system:index',
+//   rightField: 'system:index'
+// });
+
+// // Create the join.
+// var simpleJoin = ee.Join.simple();
+
+// // Applt join
+// var mod1join = ee.ImageCollection(simpleJoin.apply(smoothed_lswi, smoothed_evi, filter))
+// var mod2join = ee.ImageCollection(simpleJoin.apply(smoothed_evi, smoothed_lswi, filter))
+
+// //print('Joined', mod1join, mod2join)
+
+// var final_col = mod1join.map(function(img){
+
+//   // Create a collection with 1 image
+//   var temp = ee.ImageCollection(ee.List([img]));
+
+//   // Apply join to collection 2
+//   // Resulting collection will have 1 image with exact same date as img
+//   var join = simpleJoin.apply(mod2join, temp, filter);
+
+//   // Get resulting image
+//   var i2 = ee.Image(join.first())
+
+//   return img.addBands(i2)
+// })
+
+// //print(final_col)
+
+// // ---- add LSWI-EVI band-------------------------
+
+// var addlswi_evi = function(image) {
+//   var DOY = image.date().getRelative('day', 'year')
+//   var year = image.date().get('year')
+  
+//   return image
+//       .addBands(image.expression('(lswi-evi)', {
+//       'lswi':image.select('LSWI_lm'),
+//       'evi':image.select('EVI_lm')
+//     }).toDouble().rename('LSWI_EVI'))
+    
+//     .addBands(ee.Image(DOY).rename('DOY').toDouble())
+//     // add a year band.
+//     .addBands(ee.Image(year).rename('Year').toDouble())
+    
+//     .set('DOY',DOY)
+// };
+
+// var Smooth_lswievi = final_col.map(addlswi_evi)
+// //print(Smooth_lswievi, 'Smooth_lswievi')
+
+
+// //---------------------Flooding pixels of Rice at transplanting stage (PPPM)---- (Jul to  15 sep, 2018)
+// // var clip_mangrove = function (img) {
+// //   return img.clip(wb_without_mangrove)
+// // }
+
+
+// var Flood = function (img) {
+//     var GT_0 = img.gte(0)
+//     return img.updateMask(GT_0)
+// }
+
+
+// var LM_smooth = Smooth_lswievi
+//                 .filterDate('2018-07-01','2018-09-15')
+//                 .map(Flood)
+               
+
+// //print(SG_smooth, 'SG_smooth')
+
+
+// var mean_rice_SOS = LM_smooth.reduce(ee.Reducer.max())
+
+// print(mean_rice_SOS, 'mean_rice_SOS')
+// //var viz = {'min':-1, 'max':1, palette:['#6eff00']}
+
+// //Map.addLayer(mean_rice_SOS.select('LSWI_EVI_max'), viz, 'mean_rice_SOS')
+
+// //----Rice pixels identify during MGT (IPPPM) --------------------------
+// // var clip_mangrove = function (img) {
+// //   return img.updateMask(mean_rice_SOS)
+// // }
+
+// //Rice pixels at the MGT
+// var Non_Flood = function (img) {
+//     var GT_0 = img.lte(0)
+//     return img.updateMask(GT_0)
+// }
+
+
+// var MGT_smooth = Smooth_lswievi
+//                 .filterDate('2018-09-16','2018-10-10')
+//                 .map(Non_Flood)
+
+// var mean_rice_MGT = MGT_smooth.reduce(ee.Reducer.max()).updateMask(mean_rice_SOS.select('LSWI_EVI_max'))
+// var reclass = mean_rice_MGT.select('LSWI_EVI_max').divide(2).ceil(); // reclass 
+
+// print(reclass, 'mean_rice_MGT')
+// //var viz = {'min':-1, 'max':0, palette:['blue']}
+
+// //Map.addLayer(reclass.select('LSWI_EVI_max'), viz, 'mean_rice_MGT')
+
+// // //------During export we diveded whole west bengal into two part 
+// // var Sother = ee.Geometry.Polygon(
+// //         [[[85.79697303406967, 23.495951852652485],
+// //           [85.79697303406967, 21.5042609615103],
+// //           [89.13681678406967, 21.5042609615103],
+// //           [89.13681678406967, 23.495951852652485]]])
+          
+// // var Northern = ee.Geometry.Polygon(
+// //         [[[85.7958399159222, 27.248012507637075],
+// //           [85.7958399159222, 23.495614188340667],
+// //           [89.9266992909222, 23.495614188340667],
+// //           [89.9266992909222, 27.248012507637075]]])
+// //------Eport to assets LSWI-EVI ---------------------------
+// Export.image.toAsset({
+//   image: reclass,
+//   description: 'S2_SIAC_MGT_Rice1',
+//   assetId: 'S2_SIAC_MGT_Rice1',
+//   scale: 10,
+//   region: region1,
+//   maxPixels: 1e13 
+// });
+
+
+//-------------------------------------End-------------------------------------
+
+// // //----------Extra---------------------------------------
+// // var st = ee.Date('2018-07-01');
+// // //var en = ee.Date('2018-09-15'); // for SOS
+// // var en = ee.Date('2018-10-10') // for MGT 
+
+// // var smoothed_evi = ee.ImageCollection(smoothed_evi).filterDate(st, en)
+// // var smoothed_lswi = ee.ImageCollection(smoothed_lswi).filterDate(st, en)
+
+// // //-----Batch Download---------------------------------
+// // var batch = require('users/fitoprincipe/geetools:batch')
+
+// // //-----Batch Download for EVI---------------------------
+// // batch.Download.ImageCollection.toAsset(smoothed_evi, 'EVI_lm',
+// //                                       {region: region1,
+// //                                         type: 'float',
+// //                                         scale: 20
+// //                                       })
+
+// // //-----Batch Download for LSWI---------------------------
+// // batch.Download.ImageCollection.toAsset(smoothed_evi, 'LSWI_lm',
+// //                                       {region: region1,
+// //                                         type: 'float',
+// //                                         scale: 20
+// //                                       })
+// //----------If batch download not process then you go to stack download-------------
+
+// //----------------------Plot---------------------------------------
+// //var point = ee.Geometry.Point([87.5578, 22.8065])
+
+
+// // // //merge original and smoothed data into one image collection for plotting
+// // var joined = ee.ImageCollection(add_vi.select(['EVI'],['EVI'])
+// //                 //.merge(S2_VI.select(['EVI'],['evi']))
+// //                 .merge(smoothed_evi.select(['EVI_lm'],['evi_sm'])));
+
+// // var chart = ui.Chart.image.series({
+// //   imageCollection: joined,
+// //   region: point,
+// //   reducer: ee.Reducer.mean(),
+// //   scale: 30
+// // }).setOptions({title: 'LSWI over time'});
+
+// //print(chart);
+
+// //---------------------------------------------------------------------------------
