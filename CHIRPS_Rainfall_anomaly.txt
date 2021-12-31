@@ -1,0 +1,162 @@
+
+//-------------------------------------------------CHIPS---------------------------------
+
+var geometry = 
+    ee.Geometry.Polygon(
+        [[[85.65552187885164, 27.403883170245003],
+          [85.65552187885164, 20.789932616949674],
+          [90.57739687885164, 20.789932616949674],
+          [90.57739687885164, 27.403883170245003]]])
+          
+var table = ee.FeatureCollection("users/maitiarabindageo454/Wb_District_new");
+
+
+var clip =  function(image) {
+  return image.clip(table)}
+// tmmx, pr
+var tmax = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
+            //.filterDate('2000-01-01', '2000-12-13')
+            .filter(ee.Filter.calendarRange(1998,2018,'year'))
+            //.filter(ee.Filter.calendarRange(9,9,'month'))
+            .filter(ee.Filter.dayOfYear(263, 293))
+            .select('precipitation')
+             
+//print(tmax)
+
+
+//---------------Annual average-------------------
+//set a list of start dates
+var startDate = '1998-01-01';
+var endDate = '2018-12-31';
+var yearDifference = ee.Date(startDate).advance(1, 'year').millis().subtract(ee.Date(startDate).millis());
+var listMap = ee.List.sequence(ee.Date(startDate).millis(), ee.Date(endDate).millis(), yearDifference);
+
+//var sentinel1 = ee.ImageCollection('NOAA/CDR/AVHRR/NDVI/V4')
+//function to get a weekly composite
+function getWeeklySentinelComposite(date) {
+  // Only include the VV polarization, for consistent compositing.
+var ss = tmax.select(['precipitation'])
+                      .filterDate(date, date.advance(1, 'year'))
+  var composite = ss.sum()
+                      .set('system:time_start', date.millis(), 'dateYMD', date.format('YYYY-MM-dd'), 'numbImages', ss.size());
+  return composite;
+}
+
+var AVHRR = ee.ImageCollection.fromImages(listMap.map(function(dateMillis){
+  var date = ee.Date(dateMillis);
+  return getWeeklySentinelComposite(date);
+}));
+
+
+print(AVHRR, 'AVHRR')
+//Map.addLayer(AVHRR)
+
+
+///-------------stack layers of Tmax------------------------
+var stack_lswi = function(AVHRR) {
+  // Create an initial image.
+  var first = ee.Image(AVHRR.first()).select([]);
+
+  // Write a function that appends a band to an image.
+  var appendBands = function(image, previous) {
+    return ee.Image(previous).addBands(image);
+  };
+  return ee.Image(AVHRR.iterate(appendBands, first));
+};
+var stacked_lswi = stack_lswi(AVHRR)
+
+print(stacked_lswi)
+
+
+//--------------------------
+var select_bands = stacked_lswi.select(ee.List.sequence(0,19))
+
+var mean = select_bands.reduce(ee.Reducer.mean())
+
+print(mean, 'mean')
+var select_bands18 = stacked_lswi.select(ee.List.sequence(20,20))
+
+print(select_bands18)
+
+var anomaly = select_bands18.subtract(mean).clip(table)
+var greter_0_mask_GPP = anomaly.gt(0)
+var greter_0_mask_pix_GPP = anomaly.updateMask(greter_0_mask_GPP)
+var viz = {min: -300, max: 500, palette:['#ff0606','#ff5b0e','#ffeb0c','#53ff08','#04ffa9','#0c5dff','#ffffff']};
+
+Map.addLayer(anomaly,viz, 'mean_MGT2_lt0_reclass')
+
+
+// set position of panel
+var legend = ui.Panel({
+style: {
+position: 'bottom-left',
+padding: '8px 15px'
+}
+});
+ 
+// Create legend title
+var legendTitle = ui.Label({
+value: 'Rainfall (mm)',
+style: {
+fontWeight: 'bold',
+fontSize: '18px',
+margin: '0 0 4px 0',
+padding: '0'
+}
+});
+ 
+// Add the title to the panel
+legend.add(legendTitle);
+ 
+// create the legend image
+var lon = ee.Image.pixelLonLat().select('latitude');
+var gradient = lon.multiply((viz.max-viz.min)/100.0).add(viz.min);
+var legendImage = gradient.visualize(viz);
+ 
+// create text on top of legend
+var panel = ui.Panel({
+widgets: [
+ui.Label(viz['max'])
+],
+});
+ 
+legend.add(panel);
+ 
+// create thumbnail from the image
+var thumbnail = ui.Thumbnail({
+image: legendImage,
+params: {bbox:'0,0,10,100', dimensions:'10x200'},
+style: {padding: '1px', position: 'bottom-center'}
+});
+ 
+// add the thumbnail to the legend
+legend.add(thumbnail);
+ 
+// create text on top of legend
+var panel = ui.Panel({
+widgets: [
+ui.Label(viz['min'])
+],
+});
+ 
+legend.add(panel);
+ 
+Map.add(legend);
+
+
+
+
+
+
+Export.image.toDrive({
+image:anomaly ,
+description: 'Chips_RF_Anomaly_Sept_1998_2018',
+scale: 4625,
+fileFormat: 'GeoTIFF',
+region: geometry,
+maxPixels: 3465355096,
+// formatOptions: {
+//   cloudOptimized: true
+// }
+});
+//----
