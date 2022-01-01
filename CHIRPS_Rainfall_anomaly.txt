@@ -1,6 +1,4 @@
 
-//-------------------------------------------------CHIPS---------------------------------
-
 var geometry = 
     ee.Geometry.Polygon(
         [[[85.65552187885164, 27.403883170245003],
@@ -8,84 +6,97 @@ var geometry =
           [90.57739687885164, 20.789932616949674],
           [90.57739687885164, 27.403883170245003]]])
           
-var table = ee.FeatureCollection("users/maitiarabindageo454/Wb_District_new");
-
+var LGP = ee.FeatureCollection("users/maitiarabindageo454/Wb_District_new");
+// //-------------------------------------------------CHIPS---------------------------------
 
 var clip =  function(image) {
-  return image.clip(table)}
-// tmmx, pr
-var tmax = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
-            //.filterDate('2000-01-01', '2000-12-13')
-            .filter(ee.Filter.calendarRange(1998,2018,'year'))
-            //.filter(ee.Filter.calendarRange(9,9,'month'))
-            .filter(ee.Filter.dayOfYear(263, 293))
-            .select('precipitation')
-             
-//print(tmax)
+  return image.clip(LGP)}
 
+//------Call CHIRPS data sets for 2018------------------
+var dataset = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+                  .filter(ee.Filter.date('2018-09-20', '2018-10-10'))
+                  .filterBounds(geometry)
+                  .map(function (img){return img.clip(geometry)});
+print(dataset);
+var precipitation = dataset.select('precipitation')
+                        .reduce(ee.Reducer.mean());
 
-//---------------Annual average-------------------
-//set a list of start dates
-var startDate = '1998-01-01';
-var endDate = '2018-12-31';
-var yearDifference = ee.Date(startDate).advance(1, 'year').millis().subtract(ee.Date(startDate).millis());
-var listMap = ee.List.sequence(ee.Date(startDate).millis(), ee.Date(endDate).millis(), yearDifference);
+print(precipitation, 'ppt 20-09-2018;10-10-2018');
+var precipitationVis = {
+  min: 1.0,
+  max: 17.0,
+  palette: ['001137', '0aab1e', 'e7eb05', 'ff4a2d', 'e90000'],
+};
+//Map.setCenter(88.5, 27.5, 5);
+//Map.addLayer(precipitation, precipitationVis, 'Precipitation');
 
-//var sentinel1 = ee.ImageCollection('NOAA/CDR/AVHRR/NDVI/V4')
-//function to get a weekly composite
-function getWeeklySentinelComposite(date) {
-  // Only include the VV polarization, for consistent compositing.
-var ss = tmax.select(['precipitation'])
-                      .filterDate(date, date.advance(1, 'year'))
-  var composite = ss.sum()
-                      .set('system:time_start', date.millis(), 'dateYMD', date.format('YYYY-MM-dd'), 'numbImages', ss.size());
-  return composite;
-}
+//call the data for long term
+// var chirpsData = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+//                     .filterDate('1987-09-20', '2017-10-10')
+//                     .filterBounds(India)
+//                     .map(function(img){return img.clip(India)});
 
-var AVHRR = ee.ImageCollection.fromImages(listMap.map(function(dateMillis){
-  var date = ee.Date(dateMillis);
-  return getWeeklySentinelComposite(date);
+// //Select the precipitation layer and compute mean over 30 years
+// var precip = chirpsData.select('precipitation')
+//                 .reduce(ee.Reducer.mean());
+// print(precip, 'long term mean');
+var startYear = 1988;
+var endYear = 2017;
+var startWaterMonth = 9;
+var startWaterDay = 20;
+var endWaterMonth = 10;
+var endWaterDay = 20;
+
+// Create a list of years by generating a sequence from start and end years 
+var years = ee.List.sequence(startYear, endYear);
+var chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+                .filterBounds(geometry)
+                .map(function(img){return img.clip(geometry)});
+// Generate annual summed image mosaics 
+var annualPrecip = ee.ImageCollection.fromImages(
+  years.map(function (year) {
+    var startDate = ee.Date.fromYMD(year, startWaterMonth, startWaterDay);
+    var endDate = ee.Date.fromYMD(ee.Number(year).add(1), endWaterMonth, endWaterDay);
+    var annual = chirps
+      .filterDate('1988-09-20', '2017-10-10')
+      .mean();
+    return annual
+      .set('year', year)
+      .set('system:time_start', ee.Date.fromYMD(year, 9, 20).format("YYYY_MM_dd"));
 }));
 
+print(annualPrecip);
+//Map.addLayer(annualPrecip.first());
 
-print(AVHRR, 'AVHRR')
-//Map.addLayer(AVHRR)
+//Now compute the mean
+var meanPrecip = annualPrecip.reduce(ee.Reducer.mean()); 
+print(meanPrecip, 'meanPrecip');
 
+//Compute anomaly
+var anomaly = precipitation.subtract(meanPrecip).clip(LGP);
+print(anomaly,'anomaly');
 
-///-------------stack layers of Tmax------------------------
-var stack_lswi = function(AVHRR) {
-  // Create an initial image.
-  var first = ee.Image(AVHRR.first()).select([]);
+var viz = {min: -4, max: 4, palette:['#ff0606','#ff5b0e','#ffeb0c','#53ff08','#04ffa9','#0c5dff','#ffffff']};
 
-  // Write a function that appends a band to an image.
-  var appendBands = function(image, previous) {
-    return ee.Image(previous).addBands(image);
-  };
-  return ee.Image(AVHRR.iterate(appendBands, first));
-};
-var stacked_lswi = stack_lswi(AVHRR)
+//Map add layer
+Map.addLayer(anomaly, viz,'Anomaly_Chirps');
+Map.setCenter(87.838, 23.846, 6.5)
 
-print(stacked_lswi)
+//---- add polygon--------------------------------------------------------------
+//Create an empty image into which to paint the features, cast to byte.
+var empty = ee.Image().byte();
 
+// Paint all the polygon edges with the same number and width, display.
+var outline = empty.paint({
+  featureCollection: LGP,
+  color: 1,
+  width: 1
+});
 
-//--------------------------
-var select_bands = stacked_lswi.select(ee.List.sequence(0,19))
-
-var mean = select_bands.reduce(ee.Reducer.mean())
-
-print(mean, 'mean')
-var select_bands18 = stacked_lswi.select(ee.List.sequence(20,20))
-
-print(select_bands18)
-
-var anomaly = select_bands18.subtract(mean).clip(table)
-var greter_0_mask_GPP = anomaly.gt(0)
-var greter_0_mask_pix_GPP = anomaly.updateMask(greter_0_mask_GPP)
-var viz = {min: -300, max: 500, palette:['#ff0606','#ff5b0e','#ffeb0c','#53ff08','#04ffa9','#0c5dff','#ffffff']};
-
-Map.addLayer(anomaly,viz, 'mean_MGT2_lt0_reclass')
+Map.addLayer(outline, {}, 'outline')
 
 
+//-------------------Add legend-----------------------------------------------------
 // set position of panel
 var legend = ui.Panel({
 style: {
@@ -143,11 +154,6 @@ legend.add(panel);
  
 Map.add(legend);
 
-
-
-
-
-
 Export.image.toDrive({
 image:anomaly ,
 description: 'Chips_RF_Anomaly_Sept_1998_2018',
@@ -159,4 +165,3 @@ maxPixels: 3465355096,
 //   cloudOptimized: true
 // }
 });
-//----
